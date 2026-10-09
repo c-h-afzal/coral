@@ -15,6 +15,9 @@ import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaBuilder;
+import org.apache.hadoop.hive.metastore.api.SerDeInfo;
+import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+import org.apache.hadoop.hive.metastore.api.Table;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
@@ -101,6 +104,118 @@ public class SchemaUtilitiesTests {
     Schema result = SchemaUtilities.getCasePreservedSchemaFromPropertyMaps(tableProperties, null, "test@table");
 
     Assert.assertNull(result);
+  }
+
+  /**
+   * Regression test for APA-149534: a Hive uniontype column, flattened by ingestion into a synthetic struct
+   * (e.g. "UnionStruct4036702255") with a blank namespace, must have that namespace backfilled from its
+   * namespaced enclosing record before being handed downstream (e.g. to DSM for Java codegen). Without the
+   * fix, the nested record keeps namespace:"" and ends up in Java's default package, which an enclosing
+   * class in a named package (here "com.linkedin.events.ads") cannot legally reference.
+   */
+  @Test
+  public void testGetAvroSchemaForTableBackfillsBlankNestedNamespace() {
+    String avroSchemaLiteral = "{\"type\":\"record\",\"name\":\"AdOptimizationV2Event\","
+        + "\"namespace\":\"com.linkedin.events.ads\",\"fields\":["
+        + "{\"name\":\"optimizationTrackingInfo\",\"type\":{\"type\":\"array\",\"items\":"
+        + "{\"type\":\"record\",\"name\":\"TrackingInfo\",\"fields\":[" + "{\"name\":\"trackingItem\",\"type\":"
+        + "{\"type\":\"record\",\"name\":\"UnionStruct4036702255\",\"namespace\":\"\",\"fields\":["
+        + "{\"name\":\"clickInfo\",\"type\":[\"null\",\"string\"],\"default\":null}]}}]}}}]}";
+
+    Table table = hiveAvroTable("tracking_live_daily", "adoptimizationv2event", avroSchemaLiteral);
+
+    Schema result = SchemaUtilities.getAvroSchemaForTable(table, false);
+
+    Schema trackingInfo = result.getField("optimizationTrackingInfo").schema().getElementType();
+    Schema unionStruct = trackingInfo.getField("trackingItem").schema();
+
+    Assert.assertEquals(unionStruct.getName(), "UnionStruct4036702255");
+    Assert.assertEquals(unionStruct.getNamespace(), "com.linkedin.events.ads",
+        "blank namespace on the flattened union struct must be backfilled from the enclosing record");
+    // The already-namespaced top-level record and its direct child must be unaffected.
+    Assert.assertEquals(result.getNamespace(), "com.linkedin.events.ads");
+    Assert.assertEquals(trackingInfo.getNamespace(), "com.linkedin.events.ads");
+  }
+
+  @Test
+  public void testGetAvroSchemaForTableLeavesExplicitNestedNamespaceUntouched() {
+    String avroSchemaLiteral = "{\"type\":\"record\",\"name\":\"Parent\",\"namespace\":\"com.linkedin.events.ads\","
+        + "\"fields\":[{\"name\":\"child\",\"type\":"
+        + "{\"type\":\"record\",\"name\":\"Child\",\"namespace\":\"com.other.ns\",\"fields\":["
+        + "{\"name\":\"id\",\"type\":\"int\"}]}}]}";
+
+    Table table = hiveAvroTable("db", "parent_table", avroSchemaLiteral);
+
+    Schema result = SchemaUtilities.getAvroSchemaForTable(table, false);
+
+    Assert.assertEquals(result.getField("child").schema().getNamespace(), "com.other.ns",
+        "a record with its own explicit namespace must not be overwritten");
+  }
+
+  @Test
+  public void testGetAvroSchemaForTableNoOpWhenTopLevelNamespaceIsBlank() {
+    // When even the top-level record has a blank namespace, there's nothing sensible to backfill with,
+    // so the schema should be returned unchanged rather than throwing.
+    String avroSchemaLiteral =
+        "{\"type\":\"record\",\"name\":\"NoNamespace\",\"namespace\":\"\",\"fields\":[{\"name\":\"id\",\"type\":\"int\"}]}";
+
+    Table table = hiveAvroTable("db", "no_namespace_table", avroSchemaLiteral);
+
+    Schema result = SchemaUtilities.getAvroSchemaForTable(table, false);
+
+    Assert.assertTrue(SchemaUtilities.isBlankNamespace(result.getNamespace()));
+  }
+
+  @Test
+  public void testBackfillBlankNamespacesPreservesFieldOrder() {
+    // Regression test: rebuilding a record to backfill a blank nested namespace must not silently
+    // reset a field's explicit sort order (DESCENDING/IGNORE) back to the Avro default (ASCENDING).
+    Schema blankNamespaceNested =
+        SchemaBuilder.record("Nested").namespace("").fields().name("value").type().intType().noDefault().endRecord();
+
+    Schema.Field ascendingField =
+        new Schema.Field("asc", Schema.create(Schema.Type.INT), null, (Object) null, Schema.Field.Order.ASCENDING);
+    Schema.Field descendingField =
+        new Schema.Field("desc", Schema.create(Schema.Type.INT), null, (Object) null, Schema.Field.Order.DESCENDING);
+    Schema.Field ignoreOrderField =
+        new Schema.Field("ignored", Schema.create(Schema.Type.INT), null, (Object) null, Schema.Field.Order.IGNORE);
+    Schema.Field nestedField =
+        new Schema.Field("nested", blankNamespaceNested, null, (Object) null, Schema.Field.Order.ASCENDING);
+
+    Schema parent = Schema.createRecord("Parent", null, "com.test", false);
+    parent.setFields(Arrays.asList(ascendingField, descendingField, ignoreOrderField, nestedField));
+
+    Schema result = SchemaUtilities.backfillBlankNamespaces(parent, "com.test");
+
+    Assert.assertEquals(result.getField("nested").schema().getNamespace(), "com.test",
+        "sanity check: the blank nested namespace should have been backfilled, triggering a record rebuild");
+    Assert.assertEquals(result.getField("asc").order(), Schema.Field.Order.ASCENDING);
+    Assert.assertEquals(result.getField("desc").order(), Schema.Field.Order.DESCENDING,
+        "a DESCENDING field's sort order must survive the record rebuild");
+    Assert.assertEquals(result.getField("ignored").order(), Schema.Field.Order.IGNORE,
+        "an IGNORE field's sort order must survive the record rebuild");
+  }
+
+  /** Builds a minimal Hive {@link Table} using AvroSerDe with the given {@code avro.schema.literal}. */
+  private static Table hiveAvroTable(String dbName, String tableName, String avroSchemaLiteral) {
+    SerDeInfo serDeInfo = new SerDeInfo();
+    serDeInfo.setSerializationLib("org.apache.hadoop.hive.serde2.avro.AvroSerDe");
+    serDeInfo.setParameters(new HashMap<>());
+
+    StorageDescriptor sd = new StorageDescriptor();
+    sd.setSerdeInfo(serDeInfo);
+    sd.setCols(new ArrayList<>());
+
+    Table table = new Table();
+    table.setDbName(dbName);
+    table.setTableName(tableName);
+    table.setSd(sd);
+    table.setPartitionKeys(new ArrayList<>());
+    Map<String, String> parameters = new HashMap<>();
+    parameters.put("avro.schema.literal", avroSchemaLiteral);
+    table.setParameters(parameters);
+
+    return table;
   }
 
   @Test

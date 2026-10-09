@@ -128,6 +128,16 @@ class SchemaUtilities {
       }
     }
 
+    // Guard against malformed partner Avro schemas where a nested record (commonly a struct produced by
+    // ingestion-side flattening of a Hive uniontype, e.g. "UnionStruct4036702255") was stamped with a blank
+    // namespace. A blank namespace places the record's generated Java class in the default package, which can't
+    // legally be referenced from an enclosing namespaced record, breaking downstream Java codegen (e.g. DSM).
+    // See APA-149534. If the resolved top-level schema itself lacks a namespace, there's nothing to backfill with,
+    // so we leave the schema unchanged in that case.
+    if (resultTableSchema != null && !isBlankNamespace(resultTableSchema.getNamespace())) {
+      resultTableSchema = backfillBlankNamespaces(resultTableSchema, resultTableSchema.getNamespace());
+    }
+
     return resultTableSchema;
   }
 
@@ -267,13 +277,38 @@ class SchemaUtilities {
   }
 
   static void appendField(@Nonnull Schema.Field field, @Nonnull SchemaBuilder.FieldAssembler<Schema> fieldAssembler) {
+    appendField(field, field.schema(), fieldAssembler);
+  }
+
+  /**
+   * Like {@link #appendField(Schema.Field, SchemaBuilder.FieldAssembler)}, but appends {@code field} using
+   * {@code fieldSchema} as its type rather than {@code field.schema()} &mdash; useful when the field's schema
+   * has been transformed (e.g. to backfill a blank namespace) but its name/doc/default/order should otherwise
+   * be preserved as-is.
+   */
+  static void appendField(@Nonnull Schema.Field field, @Nonnull Schema fieldSchema,
+      @Nonnull SchemaBuilder.FieldAssembler<Schema> fieldAssembler) {
     Preconditions.checkNotNull(field);
+    Preconditions.checkNotNull(fieldSchema);
     Preconditions.checkNotNull(fieldAssembler);
 
     Object defaultValue = defaultValue(field);
 
-    SchemaBuilder.GenericDefault genericDefault =
-        fieldAssembler.name(field.name()).doc(field.doc()).type(field.schema());
+    SchemaBuilder.FieldBuilder<Schema> fieldBuilder = fieldAssembler.name(field.name()).doc(field.doc());
+    switch (field.order()) {
+      case DESCENDING:
+        fieldBuilder = fieldBuilder.orderDescending();
+        break;
+      case IGNORE:
+        fieldBuilder = fieldBuilder.orderIgnore();
+        break;
+      case ASCENDING:
+      default:
+        fieldBuilder = fieldBuilder.orderAscending();
+        break;
+    }
+
+    SchemaBuilder.GenericDefault genericDefault = fieldBuilder.type(fieldSchema);
     if (defaultValue != null) {
       genericDefault.withDefault(defaultValue);
     } else {
@@ -1146,6 +1181,93 @@ class SchemaUtilities {
     replicateSchemaProps(record, copy);
 
     return copy;
+  }
+
+  /**
+   * Recursively walks {@code schema} and replaces the namespace of any nested {@code RECORD} or {@code ENUM}
+   * whose namespace is {@code null} or empty with {@code enclosingNamespace}. Schemas that already carry an
+   * explicit, non-blank namespace are left completely untouched (name, doc, props, etc.), and that namespace
+   * becomes the enclosing namespace used for their own descendants.
+   *
+   * <p>This guards against malformed Avro schemas produced upstream of Coral &mdash; e.g. Hive's ingestion-side
+   * flattening of a {@code uniontype} into a synthetic struct (such as {@code UnionStruct4036702255}) can stamp
+   * that struct with a blank namespace. A blank namespace places the record's generated Java class in the
+   * default package, and a class in a named package (e.g. {@code com.linkedin.events.ads}) cannot legally
+   * reference a default-package class, so downstream Java codegen (e.g. DSM) fails with
+   * {@code cannot find symbol}. See APA-149534.
+   *
+   * @param schema the schema to sanitize
+   * @param enclosingNamespace the namespace to backfill onto any blank-namespace record/enum encountered;
+   *                            must be non-null and non-empty
+   * @return an equivalent schema where every blank namespace has been backfilled from its closest non-blank
+   *         ancestor (or {@code enclosingNamespace} if no ancestor had one)
+   */
+  static Schema backfillBlankNamespaces(@Nonnull Schema schema, @Nonnull String enclosingNamespace) {
+    Preconditions.checkNotNull(schema);
+    Preconditions.checkArgument(!isBlankNamespace(enclosingNamespace), "enclosingNamespace must not be blank");
+
+    switch (schema.getType()) {
+      case RECORD: {
+        String namespace = isBlankNamespace(schema.getNamespace()) ? enclosingNamespace : schema.getNamespace();
+        List<Schema.Field> originalFields = schema.getFields();
+        List<Schema> newFieldSchemas = new ArrayList<>(originalFields.size());
+        boolean changed = !namespace.equals(schema.getNamespace());
+        for (Schema.Field field : originalFields) {
+          Schema newFieldSchema = backfillBlankNamespaces(field.schema(), namespace);
+          newFieldSchemas.add(newFieldSchema);
+          changed |= newFieldSchema != field.schema();
+        }
+        if (!changed) {
+          return schema;
+        }
+        // Rebuild via SchemaBuilder (rather than Schema.createSchemaField + setFields) so that fields with
+        // no default value are preserved as having no default, instead of silently gaining an implicit
+        // "default": null (which createSchemaField inserts for nullable-union fields regardless of whether a
+        // default was actually specified).
+        SchemaBuilder.FieldAssembler<Schema> fieldAssembler =
+            SchemaBuilder.record(schema.getName()).doc(schema.getDoc()).namespace(namespace).fields();
+        for (int i = 0; i < originalFields.size(); i++) {
+          appendField(originalFields.get(i), newFieldSchemas.get(i), fieldAssembler);
+        }
+        Schema result = fieldAssembler.endRecord();
+        for (Schema.Field originalField : originalFields) {
+          replicateFieldProps(originalField, result.getField(originalField.name()));
+        }
+        replicateSchemaProps(schema, result);
+        return result;
+      }
+      case ENUM: {
+        String namespace = isBlankNamespace(schema.getNamespace()) ? enclosingNamespace : schema.getNamespace();
+        if (namespace.equals(schema.getNamespace())) {
+          return schema;
+        }
+        return Schema.createEnum(schema.getName(), schema.getDoc(), namespace, schema.getEnumSymbols());
+      }
+      case UNION: {
+        boolean changed = false;
+        List<Schema> newTypes = new ArrayList<>(schema.getTypes().size());
+        for (Schema type : schema.getTypes()) {
+          Schema newType = backfillBlankNamespaces(type, enclosingNamespace);
+          changed |= newType != type;
+          newTypes.add(newType);
+        }
+        return changed ? Schema.createUnion(newTypes) : schema;
+      }
+      case ARRAY: {
+        Schema newElementType = backfillBlankNamespaces(schema.getElementType(), enclosingNamespace);
+        return newElementType == schema.getElementType() ? schema : Schema.createArray(newElementType);
+      }
+      case MAP: {
+        Schema newValueType = backfillBlankNamespaces(schema.getValueType(), enclosingNamespace);
+        return newValueType == schema.getValueType() ? schema : Schema.createMap(newValueType);
+      }
+      default:
+        return schema;
+    }
+  }
+
+  static boolean isBlankNamespace(String namespace) {
+    return namespace == null || namespace.isEmpty();
   }
 
   static Schema.Field copyField(Schema.Field field, Schema newSchema) {
